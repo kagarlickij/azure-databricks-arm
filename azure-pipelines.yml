@@ -1,0 +1,120 @@
+resources:
+- repo: self
+  clean: true
+
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - databricks-workspace-template.json
+    - azure-pipelines.yml
+
+variables:
+  - group: azure-connection
+  - group: azure-tags
+  - group: azure-databricks
+
+stages:
+- stage: release
+  condition: contains(variables['Build.SourceBranch'], 'refs/heads/master')
+  jobs:
+  - job: deploy_databricks
+    displayName: 'Deploy Databricks'
+    timeoutInMinutes: 30
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: AzureCLI@1
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptLocation: inlineScript
+        inlineScript: |
+          if [ $(az group exists --name $(rgName) ) == false ]; then {
+              echo "Resource group does not exist, creating.."
+              az group create --name $(rgName) --location $(region)
+          } else {
+              echo "[ERROR] Resource group already exists"
+              exit 1
+          }
+          fi
+        failOnStandardError: true
+      displayName: 'Create Resource Group'
+
+    - task: AzureCLI@1
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptLocation: inlineScript
+        inlineScript: |
+          VALIDATION_OUTPUT=$(az deployment group validate --resource-group '$(rgName)' --template-file databricks-workspace-template.json --parameters project=$(project) environment=$(environment) workspaceName=$(workspaceName) | jq --raw-output '.error')
+          if [[ ${VALIDATION_OUTPUT} = "null" ]]; then {
+              echo "validation passed successfully"
+          } else {
+              echo "validation failed: ${VALIDATION_OUTPUT}"
+              exit 1
+          }
+          fi
+        failOnStandardError: true
+      displayName: 'Validate Template'
+
+    - task: AzureCLI@1
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptLocation: inlineScript
+        inlineScript: |
+          az deployment group create --name '$(Build.BuildNumber)' --resource-group '$(rgName)' --template-file databricks-workspace-template.json --parameters project=$(project) environment=$(environment) workspaceName=$(workspaceName)
+        failOnStandardError: true
+      displayName: 'Deploy Workspace'
+
+    - bash: |
+        sleep 60
+      displayName: 'Wait for workspace to become available'
+
+    - task: AzureCLI@1
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptLocation: inlineScript
+        inlineScript: |
+          TENANT_ID=$(az account show --query TENANT_ID --output tsv)
+          WORKSPACE_ID=$(az resource show --resource-type Microsoft.Databricks/workspaces --resource-group $RGNAME --name $WORKSPACENAME --query id --output tsv)
+          TOKEN=$(az account get-access-token --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d | jq --raw-output '.accessToken')
+          AZ_TOKEN=$(az account get-access-token --resource https://management.core.windows.net/ | jq --raw-output '.accessToken')
+          DB_PAT=$(curl -sf https://$(region).azuredatabricks.net/api/2.0/token/create \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "X-Databricks-Azure-SP-Management-Token:$AZ_TOKEN" \
+            -H "X-Databricks-Azure-Workspace-Resource-Id:$WORKSPACE_ID" \
+            -d '{ "lifetime_seconds": 1200, "comment": "Azure DevOps pipeline" }' \
+            | jq --raw-output '.token_value')
+          echo "##vso[task.setvariable variable=DB_PAT]$DB_PAT"
+        failOnStandardError: true
+      displayName: 'Generate Databricks Token'
+
+    - bash: |
+        CLUSTER_ID=$(curl 'https://$(region).azuredatabricks.net/api/2.0/clusters/create' \
+        --request POST \
+        --header "Content-Type: application/json" \
+        --header "Authorization: Bearer $DB_PAT" \
+        --data '{"cluster_name": "'$(clusterName)'", "spark_version": "'$(clusterVersion)'", "autotermination_minutes": 30, "num_workers": "'$(clusterWorkersQuantity)'", "node_type_id": "'$(clusterWorkersSize)'", "driver_node_type_id": "'$(clusterDriverSize)'", "custom_tags":{ "project":"'$(project)'", "environment":"'$(environment)'" } }' \
+        | jq --raw-output '.cluster_id')
+        echo "[INFO] CLUSTER_ID: $CLUSTER_ID"
+        echo "##vso[task.setvariable variable=CLUSTER_ID]$CLUSTER_ID"
+      displayName: 'Create cluster'
+
+    - bash: |
+        sleep 600
+      displayName: 'Wait for cluster to be created'
+
+    - bash: |
+        STATE=$(curl "https://eastus.azuredatabricks.net/api/2.0/clusters/get?cluster_id=$CLUSTER_ID" \
+        --request GET \
+        --header "Authorization: Bearer $DB_PAT" \
+        | jq --raw-output '.state' )
+        if [ "$STATE" == "RUNNING" ]; then
+            echo "[INFO] cluster has been created"
+        else
+            echo "[ERROR] cluster was not created, current state is $STATE"
+            exit 1
+        fi
+      displayName: 'Check cluster'
