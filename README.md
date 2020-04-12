@@ -1,6 +1,6 @@
 | Build status  | License |
 | ------------- | ------------- |
-| [![Build Status](https://dev.azure.com/kagarlickij/databricks-arm-template/_apis/build/status/databricks-arm-template-deploy?branchName=master)](https://dev.azure.com/kagarlickij/databricks-arm-template/_build/latest?definitionId=55&branchName=master) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)  |
+| [![Build Status](https://dev.azure.com/kagarlickij/databricks-arm-template/_apis/build/status/databricks-arm-template-deploy?branchName=master)](https://dev.azure.com/kagarlickij/databricks-arm-template/_build/latest?definitionId=57&branchName=master) | [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE.md)  |
 
 # Task
 Provision Azure Databricks workspace and cluster ([only interactive cluster can be created in advance](https://docs.databricks.com/clusters/index.html))  
