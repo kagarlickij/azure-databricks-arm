@@ -1,0 +1,148 @@
+resources:
+- repo: self
+  clean: true
+
+trigger:
+  branches:
+    include:
+    - master
+  paths:
+    include:
+    - databricks-workspace-template.json
+
+variables:
+  - group: azure-connection
+  - group: azure-tags
+  - group: azure-databricks
+
+stages:
+- stage: release
+  condition: contains(variables['Build.SourceBranch'], 'refs/heads/master')
+  jobs:
+  - job: deploy_databricks
+    displayName: 'Deploy Databricks'
+    timeoutInMinutes: 30
+    pool:
+      vmImage: 'windows-latest'
+    steps:
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $RESULT = (az group exists --name $(rgName))
+          if ($RESULT -eq 'false') {
+            Write-Output "[INFO] Resource group does not exist, creating.."
+            az group create --name $(rgName) --location $(region)
+          } else {
+            Write-Output "[ERROR] Resource group already exists"
+            exit 1
+          }
+        failOnStandardError: true
+      displayName: 'Create Resource Group'
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $VALIDATION_OUTPUT = (az deployment group validate --resource-group '$(rgName)' --template-file databricks-workspace-template.json --parameters project=$(project) environment=$(environment) workspaceName=$(workspaceName) | jq --raw-output '.error')
+          if ( $VALIDATION_OUTPUT -eq "null" ) {
+            Write-Output "[INFO] validation passed successfully"
+          } else {
+            Write-Output "[ERROR] validation failed: $VALIDATION_OUTPUT"
+            exit 1
+          }
+        failOnStandardError: true
+      displayName: 'Validate Template'
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          az deployment group create --name '$(Build.BuildNumber)' --resource-group '$(rgName)' --template-file databricks-workspace-template.json --parameters project=$(project) environment=$(environment) workspaceName=$(workspaceName)
+        failOnStandardError: true
+      displayName: 'Deploy Workspace'
+
+    - powershell: |
+        Start-Sleep -Seconds 60
+      displayName: 'Wait for workspace API to become available'
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $WORKSPACE_ID = (az resource show --resource-type Microsoft.Databricks/workspaces --resource-group '$(rgName)' --name '$(workspaceName)' --query id --output tsv)
+          $TOKEN = (az account get-access-token --resource 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d | jq --raw-output '.accessToken')
+          $AZ_TOKEN = (az account get-access-token --resource https://management.core.windows.net/ | jq --raw-output '.accessToken')
+          $HEADERS = @{
+              "Authorization" = "Bearer $TOKEN"
+              "X-Databricks-Azure-SP-Management-Token" = "$AZ_TOKEN"
+              "X-Databricks-Azure-Workspace-Resource-Id" = "$WORKSPACE_ID"
+          }
+          $BODY = @'
+          { "lifetime_seconds": 1200, "comment": "Azure DevOps pipeline" }
+          '@
+          $DB_PAT = ((Invoke-RestMethod -Method POST -Uri "https://$(region).azuredatabricks.net/api/2.0/token/create" -Headers $HEADERS -Body $BODY).token_value)
+          Write-Output "##vso[task.setvariable variable=DB_PAT]$DB_PAT"
+        failOnStandardError: true
+      displayName: 'Generate Databricks Token'
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $HEADERS = @{
+              "Authorization" = "Bearer $Env:DB_PAT"
+              "Content-Type" = "application/json"
+          }
+          $BODY = @"
+          {"cluster_name": "$(clusterName)", "spark_version": "$(clusterVersion)", "autotermination_minutes": 30, "num_workers": "$(clusterWorkersQuantity)", "node_type_id": "$(clusterWorkersSize)", "driver_node_type_id": "$(clusterDriverSize)", "custom_tags":{ "project":"$(project)", "environment":"$(environment)" } }
+          "@
+          $CLUSTER_ID = ((Invoke-RestMethod -Method POST -Uri "https://$(region).azuredatabricks.net/api/2.0/clusters/create" -Headers $HEADERS -Body $BODY).cluster_id)
+          if ( $CLUSTER_ID -ne "null" ) {
+            Write-Output "[INFO] CLUSTER_ID: $CLUSTER_ID"
+            Write-Output "##vso[task.setvariable variable=CLUSTER_ID]$CLUSTER_ID"
+          } else {
+            Write-Output "[ERROR] cluster was not created"
+            exit 1
+          }
+        failOnStandardError: true
+      displayName: 'Create cluster'
+
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: ps
+        scriptLocation: inlineScript
+        inlineScript: |
+          $RETRY_LIMIT = 15
+          $RETRY_TIME = 60
+          $RETRY_COUNT = 0
+          for( $RETRY_COUNT = 1; $RETRY_COUNT -le $RETRY_LIMIT; $RETRY_COUNT++ ) {
+              Write-Output "[INFO] Attempt $RETRY_COUNT of $RETRY_LIMIT"
+              $HEADERS = @{
+                  "Authorization" = "Bearer $Env:DB_PAT"
+              }
+              $STATE = ((Invoke-RestMethod -Method GET -Uri "https://$(region).azuredatabricks.net/api/2.0/clusters/get?cluster_id=$Env:CLUSTER_ID" -Headers $HEADERS).state)
+              if ($STATE -eq "RUNNING") {
+                  Write-Output "[INFO] Cluster is running, proceeding.."
+                  return
+              } else {
+                  Write-Output "[INFO] Cluster is still not ready, current state: $STATE Next check in $RETRY_TIME seconds.."
+                  Start-Sleep -Seconds $RETRY_TIME
+              }
+          }
+          Write-Output "[ERROR] No more attempts left, breaking.."
+          exit 1
+        failOnStandardError: true
+      displayName: 'Check cluster'
